@@ -1,0 +1,10 @@
+[package]
+name = "py32_flasher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+probe-rs = "0.32.0"
+bit_field = "0.10.3"
+clap = { version = "4.6.6", features = ["derive"] }
