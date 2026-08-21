@@ -18,10 +18,12 @@ Commands:
   enable-rdp       Enable readout protection
   read-opt-bytes   Read option bytes
   write-opt-bytes  Write option bytes
+  auto             Automatic flashing mode
   help             Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help  Print help
+  -h, --help     Print help
+  -V, --version  Print version
 ```
 
 ### Installation
