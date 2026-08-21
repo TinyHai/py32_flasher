@@ -15,7 +15,7 @@ use probe_rs::{
 use crate::flash::{Flash, OptBytes, py32f0xx::PY32F0xx};
 
 #[derive(clap::Parser)]
-#[clap(name = "PY32 Flasher", about = "PY32 Flasher based on probe-rs")]
+#[clap(name = "PY32 Flasher", about = "PY32 Flasher based on probe-rs", version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
     #[clap(subcommand)]
     sub: Commands,
