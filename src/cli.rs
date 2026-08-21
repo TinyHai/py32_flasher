@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use anyhow::{Ok, anyhow};
+use anyhow::anyhow;
 use clap::Parser;
 use probe_rs::{
     Permissions, Session,
@@ -37,6 +37,8 @@ enum Commands {
     ReadOptBytes(CommonOptions),
     /// Write option bytes
     WriteOptBytes(WriteOptBytesOptions),
+    /// Automatic flashing mode
+    Auto(AutomaticFlashOptions),
 }
 
 #[derive(clap::Parser, Debug)]
@@ -84,7 +86,16 @@ struct WriteOptBytesOptions {
     file: PathBuf,
 }
 
-#[derive(clap::ValueEnum, Clone, Default, Debug)]
+#[derive(clap::Parser, Debug)]
+struct AutomaticFlashOptions {
+    #[clap(flatten)]
+    flash_options: FlashOptions,
+    /// Maximum number of flashing
+    #[arg(long, short, default_value = "0")]
+    max_count: u32,
+}
+
+#[derive(clap::ValueEnum, Clone, Default, Debug, Copy)]
 enum Format {
     #[default]
     Hex,
@@ -92,7 +103,7 @@ enum Format {
     Elf,
 }
 
-#[derive(clap::ValueEnum, Clone, Default, Debug)]
+#[derive(clap::ValueEnum, Clone, Default, Debug, Copy)]
 enum Protocol {
     #[default]
     Swd,
@@ -112,82 +123,12 @@ impl Cli {
                     println!("[{}] {}", index, probe);
                 }
             }
-            Commands::Flash(flash_options) => {
-                let mut session = try_attach(probes, flash_options.common)?;
-                let path = flash_options.file.as_path();
-                let format: Box<dyn ImageLoader> = match flash_options.format {
-                    Some(format) => match format {
-                        Format::Hex => Box::new(HexLoader),
-                        Format::Binary => Box::new(BinLoader(BinOptions {
-                            base_address: Some(0x8000000),
-                            ..Default::default()
-                        })),
-                        Format::Elf => Box::new(ElfLoader(ElfOptions::default())),
-                    },
-                    None => match path.extension() {
-                        Some(ext) => match ext.to_string_lossy().as_ref() {
-                            "bin" => Box::new(BinLoader(BinOptions {
-                                base_address: Some(0x8000000),
-                                ..Default::default()
-                            })),
-                            "hex" => Box::new(HexLoader),
-                            "elf" => Box::new(ElfLoader(ElfOptions::default())),
-                            ext => return Err(anyhow!("unsupported file format: {}", ext)),
-                        },
-                        None => Box::new(ElfLoader(ElfOptions::default())),
-                    },
-                };
-
-                let skip_erase = if flash_options.disable_rdp_before_flash {
-                    let core = &mut session.core(0)?;
-                    let mut py32f0xx = PY32F0xx::new(core);
-                    let mut opt_bytes = py32f0xx.get_opt_bytes()?;
-                    if opt_bytes.is_rdp_enable() {
-                        opt_bytes.disable_rdp();
-                        py32f0xx.set_opt_bytes(opt_bytes)?;
-                        println!("Disable RDP finish.");
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                let mut download_options = DownloadOptions::default();
-                download_options.skip_erase = skip_erase;
-                let result = flashing::download_file_with_options(
-                    &mut session,
-                    path,
-                    format,
-                    download_options,
-                );
-
-                let mut core = session.core(0)?;
-                if result.is_ok() && flash_options.enable_rdp_after_flash {
-                    let mut py32f0xx = PY32F0xx::new(&mut core);
-                    let mut option_bytes = py32f0xx.get_opt_bytes()?;
-                    option_bytes.enable_rdp();
-                    py32f0xx.set_opt_bytes(option_bytes)?;
-                    core.reset()?;
-                    println!("Enable RDP finish.")
-                }
-                let should_reset = result.as_ref().is_err_and(|err| {
-                    if let FileDownloadError::Flash(_) = err {
-                        true
-                    } else {
-                        false
-                    }
-                }) || flash_options.reset_after_flash;
-
-                if should_reset {
-                    core.reset()?;
-                }
-                result?;
-
-                println!("Flash finish!");
+            Commands::Flash(ref flash_options) => {
+                let mut session = try_attach(probes, &flash_options.common)?;
+                flash_once(&mut session, flash_options)?;
             }
             Commands::DisableRDP(options) => {
-                let mut session = try_attach(probes, options)?;
+                let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
                 let mut py32f003 = PY32F0xx::new(&mut core);
                 let mut opt_bytes = py32f003.get_opt_bytes()?;
@@ -200,7 +141,7 @@ impl Cli {
                 }
             }
             Commands::EnableRDP(options) => {
-                let mut session = try_attach(probes, options)?;
+                let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
                 let mut py32f003 = PY32F0xx::new(&mut core);
                 let mut opt_bytes = py32f003.get_opt_bytes()?;
@@ -213,7 +154,7 @@ impl Cli {
                 }
             }
             Commands::ReadOptBytes(options) => {
-                let mut session = try_attach(probes, options)?;
+                let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
                 let mut py32f0xx = PY32F0xx::new(&mut core);
                 println!("{}", py32f0xx.get_opt_bytes()?);
@@ -221,7 +162,7 @@ impl Cli {
             Commands::WriteOptBytes(options) => {
                 let bytes = fs::read(options.file)?;
                 let option_bytes = OptBytes::try_from(bytes.as_slice())?;
-                let mut session = try_attach(probes, options.common)?;
+                let mut session = try_attach(probes, &options.common)?;
                 let mut core = session.core(0)?;
                 let mut py32f0xx = PY32F0xx::new(&mut core);
                 let old_opt_bytes = py32f0xx.get_opt_bytes()?;
@@ -241,16 +182,16 @@ impl Cli {
                     println!("{}", target);
                 }
             }
+            Commands::Auto(options) => flash_looping(probes, options)?,
         }
         Ok(())
     }
 }
 
-fn try_attach(mut probes: Vec<DebugProbeInfo>, options: CommonOptions) -> anyhow::Result<Session> {
+fn try_attach(mut probes: Vec<DebugProbeInfo>, options: &CommonOptions) -> anyhow::Result<Session> {
     let protocol = options.protocol.unwrap_or_default();
     let speed = options.speed;
     let probe_index = options.probe_index;
-    let target_chip = options.chip;
     if let Some(probe) = probes.get_mut(probe_index) {
         let mut probe = probe.open()?;
         probe.set_speed(speed.unwrap_or(4600))?;
@@ -258,8 +199,113 @@ fn try_attach(mut probes: Vec<DebugProbeInfo>, options: CommonOptions) -> anyhow
             Protocol::Swd => WireProtocol::Swd,
             Protocol::Jtag => WireProtocol::Jtag,
         })?;
-        Ok(probe.attach(&target_chip, Permissions::default())?)
+        Ok(probe.attach(options.chip.as_str(), Permissions::default())?)
     } else {
         Err(anyhow!("Probe not found; index: {}", probe_index))
     }
+}
+
+fn flash_looping(
+    probes: Vec<DebugProbeInfo>,
+    options: AutomaticFlashOptions,
+) -> anyhow::Result<()> {
+    let mut flashing_cnt = 1u32;
+    let max_cnt = options.max_count;
+    loop {
+        println!("Prepare flash. Cnt: {}", flashing_cnt);
+        println!("Waiting chip connect");
+        let mut session = loop {
+            if let Ok(session) = try_attach(probes.clone(), &options.flash_options.common) {
+                break session;
+            }
+        };
+        println!("Chip connected");
+        println!("Flash start: Cnt: {}", flashing_cnt);
+        match flash_once(&mut session, &options.flash_options) {
+            Ok(_) => {
+                println!("Flash end. Cnt: {}", flashing_cnt);
+                if flashing_cnt == max_cnt {
+                    break;
+                }
+                flashing_cnt = flashing_cnt.wrapping_add(1);
+            }
+            Err(err) => {
+                println!("Flash err: {}; Cnt: {}", err, flashing_cnt);
+            }
+        }
+        println!("Waiting chip disconnect.");
+        while let Ok(_) = session.core(0) {}
+    }
+    Ok(())
+}
+
+fn flash_once(session: &mut Session, flash_options: &FlashOptions) -> anyhow::Result<()> {
+    let path = flash_options.file.as_path();
+    let format: Box<dyn ImageLoader> = match flash_options.format {
+        Some(format) => match format {
+            Format::Hex => Box::new(HexLoader),
+            Format::Binary => Box::new(BinLoader(BinOptions {
+                base_address: Some(0x8000000),
+                ..Default::default()
+            })),
+            Format::Elf => Box::new(ElfLoader(ElfOptions::default())),
+        },
+        None => match path.extension() {
+            Some(ext) => match ext.to_string_lossy().as_ref() {
+                "bin" => Box::new(BinLoader(BinOptions {
+                    base_address: Some(0x8000000),
+                    ..Default::default()
+                })),
+                "hex" => Box::new(HexLoader),
+                "elf" => Box::new(ElfLoader(ElfOptions::default())),
+                ext => return Err(anyhow!("unsupported file format: {}", ext)),
+            },
+            None => Box::new(ElfLoader(ElfOptions::default())),
+        },
+    };
+
+    let skip_erase = if flash_options.disable_rdp_before_flash {
+        let core = &mut session.core(0)?;
+        let mut py32f0xx = PY32F0xx::new(core);
+        let mut opt_bytes = py32f0xx.get_opt_bytes()?;
+        if opt_bytes.is_rdp_enable() {
+            opt_bytes.disable_rdp();
+            py32f0xx.set_opt_bytes(opt_bytes)?;
+            println!("Disable RDP finish.");
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let mut download_options = DownloadOptions::default();
+    download_options.skip_erase = skip_erase;
+    println!("Downloading...");
+    let result = flashing::download_file_with_options(session, path, format, download_options);
+
+    let mut core = session.core(0)?;
+    if result.is_ok() && flash_options.enable_rdp_after_flash {
+        let mut py32f0xx = PY32F0xx::new(&mut core);
+        let mut option_bytes = py32f0xx.get_opt_bytes()?;
+        option_bytes.enable_rdp();
+        py32f0xx.set_opt_bytes(option_bytes)?;
+        core.reset()?;
+        println!("Enable RDP finish.")
+    }
+    let should_reset = result.as_ref().is_err_and(|err| {
+        if let FileDownloadError::Flash(_) = err {
+            true
+        } else {
+            false
+        }
+    }) || flash_options.reset_after_flash;
+
+    if should_reset {
+        core.reset()?;
+    }
+    result?;
+
+    println!("Flash finish!");
+    Ok(())
 }

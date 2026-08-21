@@ -1,5 +1,3 @@
-use std::{thread::sleep, time::Duration};
-
 use anyhow::Ok;
 use bit_field::BitField;
 use probe_rs::{Core, MemoryInterface};
@@ -165,7 +163,7 @@ where
 
         while self.get_opt_bytes()? != bytes {}
 
-        sleep(Duration::from_secs(1));
+        // sleep(Duration::from_secs(1));
 
         let mut sr = self.sr()?;
         sr.set_bit(0, true);
