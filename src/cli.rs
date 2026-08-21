@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::anyhow;
 use clap::Parser;
@@ -7,7 +11,7 @@ use probe_rs::{
     config::Registry,
     flashing::{
         self, BinLoader, BinOptions, DownloadOptions, ElfLoader, ElfOptions, FileDownloadError,
-        HexLoader, ImageLoader,
+        FlashProgress, HexLoader, ImageLoader,
     },
     probe::{DebugProbeInfo, WireProtocol, list::Lister},
 };
@@ -72,6 +76,9 @@ struct FlashOptions {
     /// Enable rdp after flash
     #[arg(long, short, default_value = "false")]
     enable_rdp_after_flash: bool,
+    /// Verify after flash
+    #[arg(long, short, default_value = "false")]
+    verify: bool,
     /// Reset after flash
     #[arg(long, short, default_value = "false")]
     reset_after_flash: bool,
@@ -130,6 +137,7 @@ impl Cli {
             Commands::DisableRDP(options) => {
                 let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
+                core.halt(Duration::from_millis(100))?;
                 let mut py32f003 = PY32F0xx::new(&mut core);
                 let mut opt_bytes = py32f003.get_opt_bytes()?;
                 if opt_bytes.is_rdp_enable() {
@@ -143,6 +151,7 @@ impl Cli {
             Commands::EnableRDP(options) => {
                 let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
+                core.halt(Duration::from_millis(100))?;
                 let mut py32f003 = PY32F0xx::new(&mut core);
                 let mut opt_bytes = py32f003.get_opt_bytes()?;
                 if opt_bytes.is_rdp_enable() {
@@ -156,6 +165,7 @@ impl Cli {
             Commands::ReadOptBytes(options) => {
                 let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
+                core.halt(Duration::from_millis(100))?;
                 let mut py32f0xx = PY32F0xx::new(&mut core);
                 println!("{}", py32f0xx.get_opt_bytes()?);
             }
@@ -164,6 +174,7 @@ impl Cli {
                 let option_bytes = OptBytes::try_from(bytes.as_slice())?;
                 let mut session = try_attach(probes, &options.common)?;
                 let mut core = session.core(0)?;
+                core.halt(Duration::from_millis(100))?;
                 let mut py32f0xx = PY32F0xx::new(&mut core);
                 let old_opt_bytes = py32f0xx.get_opt_bytes()?;
                 println!("Old OptBytes: {}", old_opt_bytes);
@@ -213,7 +224,8 @@ fn flash_looping(
     let max_cnt = options.max_count;
     loop {
         println!("Prepare flash. Cnt: {}", flashing_cnt);
-        println!("Waiting chip connect");
+        println!(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+        println!("Waiting chip connect.");
         let mut session = loop {
             if let Ok(session) = try_attach(probes.clone(), &options.flash_options.common) {
                 break session;
@@ -231,6 +243,7 @@ fn flash_looping(
             }
             Err(err) => {
                 println!("Flash err: {}; Cnt: {}", err, flashing_cnt);
+                continue;
             }
         }
         println!("Waiting chip disconnect.");
@@ -266,6 +279,7 @@ fn flash_once(session: &mut Session, flash_options: &FlashOptions) -> anyhow::Re
 
     let skip_erase = if flash_options.disable_rdp_before_flash {
         let core = &mut session.core(0)?;
+        core.halt(Duration::from_millis(100))?;
         let mut py32f0xx = PY32F0xx::new(core);
         let mut opt_bytes = py32f0xx.get_opt_bytes()?;
         if opt_bytes.is_rdp_enable() {
@@ -280,11 +294,65 @@ fn flash_once(session: &mut Session, flash_options: &FlashOptions) -> anyhow::Re
         false
     };
     let mut download_options = DownloadOptions::default();
+    let mut erasing_start: Option<Instant> = None;
+    let mut programing_start: Option<Instant> = None;
+    let mut verifying_start: Option<Instant> = None;
+    download_options.progress = FlashProgress::new(|event| match event {
+        flashing::ProgressEvent::FlashLayoutReady { .. } => {}
+        flashing::ProgressEvent::AddProgressBar { .. } => {}
+        flashing::ProgressEvent::Started(progress_operation) => match progress_operation {
+            flashing::ProgressOperation::Fill => {}
+            flashing::ProgressOperation::Erase => {
+                println!("Erasing...");
+                erasing_start = Some(Instant::now());
+            }
+            flashing::ProgressOperation::Program => {
+                println!("Programing...");
+                programing_start = Some(Instant::now());
+            }
+            flashing::ProgressOperation::Verify => {
+                println!("Verifying...");
+                verifying_start = Some(Instant::now());
+            }
+        },
+        flashing::ProgressEvent::Progress { .. } => {}
+        flashing::ProgressEvent::Failed(..) => {}
+        flashing::ProgressEvent::Finished(progress_operation) => match progress_operation {
+            flashing::ProgressOperation::Fill => {}
+            flashing::ProgressOperation::Erase => {
+                erasing_start.map(|start| {
+                    println!(
+                        "Erase finish. elapsed: {} ms",
+                        Instant::now().duration_since(start).as_millis()
+                    );
+                });
+            }
+            flashing::ProgressOperation::Program => {
+                programing_start.map(|start| {
+                    println!(
+                        "Program finish. elapsed: {} ms",
+                        Instant::now().duration_since(start).as_millis()
+                    );
+                });
+            }
+            flashing::ProgressOperation::Verify => {
+                verifying_start.map(|start| {
+                    println!(
+                        "Verify finish. elapsed: {} ms",
+                        Instant::now().duration_since(start).as_millis()
+                    );
+                });
+            }
+        },
+        flashing::ProgressEvent::DiagnosticMessage { message } => println!("Message: {}", message),
+    });
     download_options.skip_erase = skip_erase;
+    download_options.verify = flash_options.verify;
     println!("Downloading...");
     let result = flashing::download_file_with_options(session, path, format, download_options);
 
     let mut core = session.core(0)?;
+    core.halt(Duration::from_millis(100))?;
     if result.is_ok() && flash_options.enable_rdp_after_flash {
         let mut py32f0xx = PY32F0xx::new(&mut core);
         let mut option_bytes = py32f0xx.get_opt_bytes()?;
