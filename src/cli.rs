@@ -1,13 +1,14 @@
 use std::{
     fs,
     path::PathBuf,
+    thread::sleep,
     time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
 use clap::Parser;
 use probe_rs::{
-    Permissions, Session,
+    Core, Permissions, Session,
     config::Registry,
     flashing::{
         self, BinLoader, BinOptions, DownloadOptions, ElfLoader, ElfOptions, FileDownloadError,
@@ -16,7 +17,10 @@ use probe_rs::{
     probe::{DebugProbeInfo, WireProtocol, list::Lister},
 };
 
-use crate::flash::{Flash, OptBytes, py32f0xx::PY32F0xx};
+use crate::flash::{
+    Flash,
+    py32f0xx::{PY32F002, PY32F003, PY32F07x, PY32F030},
+};
 
 #[derive(clap::Parser)]
 #[clap(name = "PY32 Flasher", about = "PY32 Flasher based on probe-rs", version = env!("CARGO_PKG_VERSION"))]
@@ -138,11 +142,11 @@ impl Cli {
                 let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
                 core.halt(Duration::from_millis(100))?;
-                let mut py32f003 = PY32F0xx::new(&mut core);
-                let mut opt_bytes = py32f003.get_opt_bytes()?;
+                let mut flash = new_flash(&options.chip, &mut core)?;
+                let mut opt_bytes = flash.get_opt_bytes()?;
                 if opt_bytes.is_rdp_enable() {
                     opt_bytes.disable_rdp();
-                    py32f003.set_opt_bytes(opt_bytes)?;
+                    flash.set_opt_bytes(opt_bytes)?;
                     println!("Disable RDP success.")
                 } else {
                     println!("RDP already disabled.")
@@ -152,13 +156,13 @@ impl Cli {
                 let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
                 core.halt(Duration::from_millis(100))?;
-                let mut py32f003 = PY32F0xx::new(&mut core);
-                let mut opt_bytes = py32f003.get_opt_bytes()?;
+                let mut flash = new_flash(&options.chip, &mut core)?;
+                let mut opt_bytes = flash.get_opt_bytes()?;
                 if opt_bytes.is_rdp_enable() {
                     println!("RDP already enabled.")
                 } else {
                     opt_bytes.enable_rdp();
-                    py32f003.set_opt_bytes(opt_bytes)?;
+                    flash.set_opt_bytes(opt_bytes)?;
                     println!("Enable RDP success.")
                 }
             }
@@ -166,21 +170,21 @@ impl Cli {
                 let mut session = try_attach(probes, &options)?;
                 let mut core = session.core(0)?;
                 core.halt(Duration::from_millis(100))?;
-                let mut py32f0xx = PY32F0xx::new(&mut core);
-                println!("{}", py32f0xx.get_opt_bytes()?);
+                let mut flash = new_flash(&options.chip, &mut core)?;
+                println!("{}", flash.get_opt_bytes()?);
             }
             Commands::WriteOptBytes(options) => {
-                let bytes = fs::read(options.file)?;
-                let option_bytes = OptBytes::try_from(bytes.as_slice())?;
                 let mut session = try_attach(probes, &options.common)?;
                 let mut core = session.core(0)?;
                 core.halt(Duration::from_millis(100))?;
-                let mut py32f0xx = PY32F0xx::new(&mut core);
-                let old_opt_bytes = py32f0xx.get_opt_bytes()?;
+                let mut flash = new_flash(&options.common.chip, &mut core)?;
+                let bytes = fs::read(options.file)?;
+                let option_bytes = flash.parse_opt_bytes(&bytes)?;
+                let old_opt_bytes = flash.get_opt_bytes()?;
                 println!("Old OptBytes: {}", old_opt_bytes);
                 println!("New OptBytes: {}", option_bytes);
-                if option_bytes != py32f0xx.get_opt_bytes()? {
-                    py32f0xx.set_opt_bytes(option_bytes)?;
+                if option_bytes != flash.get_opt_bytes()? {
+                    flash.set_opt_bytes(option_bytes)?;
                     println!("OptBytes write done.");
                 } else {
                     println!("OptBytes unchanged.")
@@ -197,6 +201,23 @@ impl Cli {
         }
         Ok(())
     }
+}
+
+fn new_flash<'c, 's>(family: &str, core: &'c mut Core<'s>) -> anyhow::Result<Box<dyn Flash + 'c>> {
+    let lowercase = family.to_lowercase();
+    if lowercase.starts_with("py32f030") {
+        return Ok(Box::new(PY32F030::new(core)));
+    }
+    if lowercase.starts_with("py32f003") {
+        return Ok(Box::new(PY32F003::new(core)));
+    }
+    if lowercase.starts_with("py32f07") {
+        return Ok(Box::new(PY32F07x::new(core)));
+    }
+    if lowercase.starts_with("py32f002") {
+        return Ok(Box::new(PY32F002::new(core)));
+    }
+    Err(anyhow!("Unsupported family: {}", family))
 }
 
 fn try_attach(mut probes: Vec<DebugProbeInfo>, options: &CommonOptions) -> anyhow::Result<Session> {
@@ -248,6 +269,7 @@ fn flash_looping(
         }
         println!("Waiting chip disconnect.");
         while let Ok(_) = session.core(0) {}
+        sleep(Duration::from_millis(500));
     }
     Ok(())
 }
@@ -280,11 +302,11 @@ fn flash_once(session: &mut Session, flash_options: &FlashOptions) -> anyhow::Re
     let skip_erase = if flash_options.disable_rdp_before_flash {
         let core = &mut session.core(0)?;
         core.halt(Duration::from_millis(100))?;
-        let mut py32f0xx = PY32F0xx::new(core);
-        let mut opt_bytes = py32f0xx.get_opt_bytes()?;
+        let mut flash = new_flash(&flash_options.common.chip, core)?;
+        let mut opt_bytes = flash.get_opt_bytes()?;
         if opt_bytes.is_rdp_enable() {
             opt_bytes.disable_rdp();
-            py32f0xx.set_opt_bytes(opt_bytes)?;
+            flash.set_opt_bytes(opt_bytes)?;
             println!("Disable RDP finish.");
             true
         } else {
@@ -354,10 +376,11 @@ fn flash_once(session: &mut Session, flash_options: &FlashOptions) -> anyhow::Re
     let mut core = session.core(0)?;
     core.halt(Duration::from_millis(100))?;
     if result.is_ok() && flash_options.enable_rdp_after_flash {
-        let mut py32f0xx = PY32F0xx::new(&mut core);
-        let mut option_bytes = py32f0xx.get_opt_bytes()?;
+        let mut flash = new_flash(&flash_options.common.chip, &mut core)?;
+        let mut option_bytes = flash.get_opt_bytes()?;
         option_bytes.enable_rdp();
-        py32f0xx.set_opt_bytes(option_bytes)?;
+        flash.set_opt_bytes(option_bytes)?;
+        drop(flash);
         core.reset()?;
         println!("Enable RDP finish.")
     }

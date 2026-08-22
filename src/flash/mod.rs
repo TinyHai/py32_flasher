@@ -1,6 +1,5 @@
 use std::fmt::Display;
 
-use anyhow::anyhow;
 use bit_field::BitField;
 
 pub mod py32f0xx;
@@ -9,6 +8,8 @@ pub mod py32f0xx;
 pub struct OptBytes {
     optr: u16,
     sdkr: u16,
+    /// f002
+    btcr: Option<u16>,
     wrpr: u16,
 }
 
@@ -26,62 +27,23 @@ impl OptBytes {
     }
 }
 
-impl TryFrom<&[u8]> for OptBytes {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() != 16 {
-            return Err(anyhow!("Content length mismatch"));
-        }
-        let (optr, right) = value.split_at(4);
-        let (sdkr, right) = right.split_at(4);
-        let (_, wrpr) = right.split_at(4);
-        let optr = {
-            let (optr, complement) = optr.split_at(2);
-            let pair = (
-                u16::from_le_bytes(optr.try_into().unwrap()),
-                u16::from_le_bytes(complement.try_into().unwrap()),
-            );
-            if pair.0 != !pair.1 {
-                return Err(anyhow!("optr does not match its complement"));
-            }
-            pair.0
-        };
-        let sdkr = {
-            let (sdkr, complement) = sdkr.split_at(2);
-            let pair = (
-                u16::from_le_bytes(sdkr.try_into().unwrap()),
-                u16::from_le_bytes(complement.try_into().unwrap()),
-            );
-            if pair.0 != !pair.1 {
-                return Err(anyhow!("sdkr does not match its complement"));
-            }
-            pair.0
-        };
-        let wrpr = {
-            let (wrpr, complement) = wrpr.split_at(2);
-            let pair = (
-                u16::from_le_bytes(wrpr.try_into().unwrap()),
-                u16::from_le_bytes(complement.try_into().unwrap()),
-            );
-            if pair.0 != !pair.1 {
-                return Err(anyhow!("wrpr does not match its complement"));
-            }
-            pair.0
-        };
-        Ok(OptBytes { optr, sdkr, wrpr })
-    }
-}
-
 impl Display for OptBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "OptBytes {{ optr: {:02X?}, sdkr: {:02X?}, wrpr: {:02X?} }}",
+            "OptBytes {{ optr: {:02X?}, sdkr: {:02X?}, btcr: {:02X?} wrpr: {:02X?} }}",
             self.optr.to_le_bytes(),
             self.sdkr.to_le_bytes(),
+            self.btcr.map(|btcr| btcr.to_le_bytes()),
             self.wrpr.to_le_bytes()
         ))
     }
+}
+
+pub trait Opt {
+    const OPT_BASE: u64;
+    const OPT_SIZE: usize;
+
+    fn parse_opt_bytes(bytes: &[u8]) -> anyhow::Result<OptBytes>;
 }
 
 pub trait Flash {
@@ -100,4 +62,6 @@ pub trait Flash {
     fn get_opt_bytes(&mut self) -> anyhow::Result<OptBytes>;
 
     fn set_opt_bytes(&mut self, bytes: OptBytes) -> anyhow::Result<()>;
+
+    fn parse_opt_bytes(&self, bytes: &[u8]) -> anyhow::Result<OptBytes>;
 }
